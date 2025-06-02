@@ -1,0 +1,17 @@
+[package]
+name = "build-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.4"
+clap = { version = "4.5.39", features = ["derive"] }
+http-body-util = "0.1.3"
+hyper = { version = "1.6.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.13", features = ["tokio"] }
+rand = "0.9.1"
+tokio = { version = "1.45.1", features = ["full"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.5", features = ["tracing"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
