@@ -1,5 +1,7 @@
 use std::{
+    env::args_os,
     ffi::OsString,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     process,
     time::Duration,
@@ -12,8 +14,13 @@ use axum::{
 };
 use clap::Parser;
 use futures::StreamExt;
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use rand::{distr::Open01, prelude::*};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
+};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -33,22 +40,19 @@ async fn main() {
         .with_env_filter("build_proxy=debug".parse::<EnvFilter>().unwrap())
         .init();
 
-    let args = std::env::args_os().take_while(|arg| arg != "--");
-    let command_args = std::env::args_os()
+    let args = args_os().take_while(|arg| arg != "--");
+    let cli = Cli::parse_from(args);
+
+    let command_args = args_os()
         .skip_while(|arg| arg != "--")
         .skip(1)
         .collect::<Vec<_>>();
-    let cli = Cli::parse_from(args);
-
     let (server, handle) = Server::new(cli.pwd.clone(), command_args).await;
-
     tokio::spawn(server.run());
 
     let app = axum::routing::any(handler).with_state(AppState { handle });
-
     info!("listening on localhost:{}", cli.port);
-
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, cli.port))
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.port))
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -64,17 +68,16 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
 
     let port = handle.get_port().await;
 
-    let io = tokio::net::TcpStream::connect(("0.0.0.0", port))
+    let io = TcpStream::connect(("0.0.0.0", port)).await.unwrap();
+
+    let (mut sender, conn) = http1::Builder::new()
+        .handshake::<_, Body>(TokioIo::new(io))
         .await
         .unwrap();
-    let io = hyper_util::rt::TokioIo::new(io);
-    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake::<_, Body>(io)
-        .await
-        .unwrap();
+
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
+            error!(%err, "connection failed");
         }
     });
 
@@ -122,21 +125,27 @@ impl Server {
                     self.handle_msg(msg).await;
                 }
                 Some(event) = watcher.next() => {
-                    if let Some((child, _)) = self.child.take() {
-                        debug!(?event, "received fs event");
-
-                        let pid = child.id();
-                        match nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid as _),
-                            nix::sys::signal::Signal::SIGKILL,
-                        ) {
-                            Ok(_) => info!("killed child process"),
-                            Err(err) => {
-                                error!(%err, "failed to kill child process");
-                            }
-                        }
-                    }
+                    self.handle_fs_event(event).await;
                 }
+            }
+        }
+    }
+
+    async fn handle_fs_event(&mut self, event: notify::Event) {
+        let Some((child, _)) = self.child.take() else {
+            return;
+        };
+
+        debug!(?event, "received fs event");
+
+        let pid = child.id();
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as _),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(_) => info!("killed child process"),
+            Err(err) => {
+                error!(%err, "failed to kill child process");
             }
         }
     }
@@ -214,7 +223,7 @@ where
     let child = cmd.spawn().unwrap();
 
     loop {
-        match tokio::net::TcpStream::connect(("0.0.0.0", port)).await {
+        match TcpStream::connect(("0.0.0.0", port)).await {
             Ok(_) => break,
             Err(_) => {
                 debug!("child not ready yet...");
