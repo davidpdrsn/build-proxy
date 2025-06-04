@@ -10,6 +10,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use clap::Parser;
@@ -66,7 +67,9 @@ struct AppState {
 async fn handler(State(state): State<AppState>, req: Request) -> Response {
     let AppState { handle } = state;
 
-    let port = handle.get_port().await;
+    let Some(port) = handle.get_port().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     let io = TcpStream::connect(("0.0.0.0", port)).await.unwrap();
 
@@ -75,11 +78,7 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
         .await
         .unwrap();
 
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            error!(%err, "connection failed");
-        }
-    });
+    tokio::task::spawn(conn);
 
     let res = sender.send_request(req).await.unwrap();
 
@@ -88,7 +87,7 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
 
 struct Server {
     rx: mpsc::Receiver<Msg>,
-    child: Option<(process::Child, u16)>,
+    child: Result<Option<(process::Child, u16)>, ChildBuildError>,
     pwd: PathBuf,
     args: Vec<OsString>,
 }
@@ -96,12 +95,12 @@ struct Server {
 impl Server {
     async fn new(pwd: PathBuf, args: Vec<OsString>) -> (Server, Handle) {
         let (tx, rx) = mpsc::channel::<Msg>(1024);
-        let (child, port) = run_child_process(&pwd, args.iter()).await;
+        let child = run_child_process(&pwd, args.iter()).await.map(Some);
 
         (
             Server {
                 rx,
-                child: Some((child, port)),
+                child,
                 pwd,
                 args,
             },
@@ -132,11 +131,20 @@ impl Server {
     }
 
     async fn handle_fs_event(&mut self, event: notify::Event) {
-        let Some((child, _)) = self.child.take() else {
-            return;
+        debug!(?event, "received fs event");
+
+        let child = match &mut self.child {
+            Ok(child) => child,
+            Err(_) => {
+                // will trigger a rebuild on the next request
+                self.child = Ok(None);
+                return;
+            }
         };
 
-        debug!(?event, "received fs event");
+        let Some((child, _)) = child.take() else {
+            return;
+        };
 
         let pid = child.id();
         match nix::sys::signal::kill(
@@ -153,14 +161,24 @@ impl Server {
     async fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::GetPort { reply } => loop {
-                if let Some((_, port)) = &self.child {
-                    _ = reply.send(*port);
-                    break;
-                } else {
-                    let (new_child, new_port) =
-                        run_child_process(&self.pwd, self.args.iter()).await;
-                    info!(?new_port, "restarted child process");
-                    self.child = Some((new_child, new_port));
+                match &self.child {
+                    Ok(Some((_, port))) => {
+                        _ = reply.send(Some(*port));
+                        break;
+                    }
+                    Ok(None) => {
+                        let new_child = run_child_process(&self.pwd, self.args.iter())
+                            .await
+                            .map(Some);
+                        if let Ok(Some((_, port))) = new_child {
+                            info!(?port, "restarted child process");
+                        }
+                        self.child = new_child;
+                    }
+                    Err(_) => {
+                        _ = reply.send(None);
+                        break;
+                    }
                 }
             },
         }
@@ -173,7 +191,7 @@ struct Handle {
 }
 
 impl Handle {
-    async fn get_port(&self) -> u16 {
+    async fn get_port(&self) -> Option<u16> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Msg::GetPort { reply: tx }).await.unwrap();
         rx.await.unwrap()
@@ -182,10 +200,13 @@ impl Handle {
 
 #[derive(Debug)]
 enum Msg {
-    GetPort { reply: oneshot::Sender<u16> },
+    GetPort { reply: oneshot::Sender<Option<u16>> },
 }
 
-async fn run_child_process<'a, I>(pwd: &Path, args: I) -> (process::Child, u16)
+async fn run_child_process<'a, I>(
+    pwd: &Path,
+    args: I,
+) -> Result<(process::Child, u16), ChildBuildError>
 where
     I: Iterator<Item = &'a OsString>,
 {
@@ -220,19 +241,26 @@ where
 
     info!(?cmd, "running child process");
 
-    let child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn().unwrap();
 
     loop {
         match TcpStream::connect(("0.0.0.0", port)).await {
             Ok(_) => break,
             Err(_) => {
                 debug!("child not ready yet...");
+
+                if let Ok(Some(status)) = child.try_wait() {
+                    if !status.success() {
+                        return Err(ChildBuildError);
+                    }
+                }
+
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
 
-    (child, port)
+    Ok((child, port))
 }
 
 fn random_port() -> u16 {
@@ -241,3 +269,6 @@ fn random_port() -> u16 {
     let max = 6000;
     ((max - min) as f32 * val + min as f32) as u16
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ChildBuildError;
