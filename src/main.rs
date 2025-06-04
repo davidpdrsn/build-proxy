@@ -34,7 +34,7 @@ struct Cli {
     #[arg(short, long)]
     port: u16,
     #[arg(long)]
-    pwd: PathBuf,
+    pwd: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -52,11 +52,13 @@ async fn main() {
     let args = args_os().take_while(|arg| arg != "--");
     let cli = Cli::parse_from(args);
 
+    let pwd = cli.pwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+
     let command_args = args_os()
         .skip_while(|arg| arg != "--")
         .skip(1)
         .collect::<Vec<_>>();
-    let (server, handle) = Server::new(cli.pwd.clone(), command_args).await;
+    let (server, handle) = Server::new(pwd.clone(), command_args).await;
     tokio::spawn(server.run());
 
     let app = axum::routing::any(handler).with_state(AppState { handle });
@@ -79,7 +81,7 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    let io = TcpStream::connect(("0.0.0.0", port)).await.unwrap();
+    let io = TcpStream::connect(("localhost", port)).await.unwrap();
 
     let (mut sender, conn) = http1::Builder::new()
         .handshake::<_, Body>(TokioIo::new(io))
@@ -88,7 +90,13 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
 
     tokio::task::spawn(conn);
 
-    let res = sender.send_request(req).await.unwrap();
+    let res = match sender.send_request(req).await {
+        Ok(res) => res,
+        Err(err) => {
+            error!(?err, "failed to send request to child");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     res.into_response()
 }
@@ -148,7 +156,7 @@ impl Server {
             }
         };
 
-        let Some((child, _)) = child.take() else {
+        let Some((child, port)) = child.take() else {
             return;
         };
 
@@ -157,7 +165,10 @@ impl Server {
             nix::unistd::Pid::from_raw(pid as _),
             nix::sys::signal::Signal::SIGKILL,
         ) {
-            Ok(_) => info!("killed child process"),
+            Ok(_) => {
+                info!(?pid, "killed child process");
+                kill_processes_listening_on_port(port);
+            }
             Err(err) => {
                 error!(%err, "failed to kill child process");
             }
@@ -250,10 +261,10 @@ where
     let mut child = cmd.spawn().unwrap();
 
     loop {
-        match TcpStream::connect(("0.0.0.0", port)).await {
+        match TcpStream::connect(("localhost", port)).await {
             Ok(_) => break,
-            Err(_) => {
-                debug!("child not ready yet...");
+            Err(err) => {
+                debug!(?err, "child not ready yet...");
 
                 if let Ok(Some(status)) = child.try_wait() {
                     if !status.success() {
@@ -278,3 +289,26 @@ fn random_port() -> u16 {
 
 #[derive(Debug, Clone, Copy)]
 struct ChildBuildError;
+
+fn kill_processes_listening_on_port(port: u16) {
+    let std::process::Output {
+        stdout,
+        status: _,
+        stderr: _,
+    } = std::process::Command::new("lsof")
+        .args(["-ti"])
+        .args([format!(":{port}")])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(stdout).unwrap();
+    for line in stdout.lines() {
+        let pid = line.parse::<i32>().unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        info!(?pid, "killed child process");
+    }
+}
