@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     net::Ipv4Addr,
     path::{Path, PathBuf},
+    pin::pin,
     process,
     time::Duration,
 };
@@ -14,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::Parser;
-use futures::StreamExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use rand::{distr::Open01, prelude::*};
@@ -22,9 +22,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
 };
-use tracing::{debug, error, info};
+use tokio_stream::StreamExt as _;
+use tracing::{debug, error, info, trace};
 use tracing_subscriber::EnvFilter;
 
+mod debounce;
 mod watch;
 
 #[derive(Parser, Debug)]
@@ -38,7 +40,13 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::fmt()
-        .with_env_filter("build_proxy=debug".parse::<EnvFilter>().unwrap())
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .as_deref()
+                .unwrap_or("build_proxy=debug")
+                .parse::<EnvFilter>()
+                .unwrap(),
+        )
         .init();
 
     let args = args_os().take_while(|arg| arg != "--");
@@ -109,14 +117,12 @@ impl Server {
     }
 
     async fn run(mut self) {
-        let mut watcher = watch::make_watcher(&self.pwd).filter(|event| {
-            std::future::ready(
-                event
-                    .paths
-                    .iter()
-                    .any(|path| path.extension().is_some_and(|ext| ext == "go")),
-            )
-        });
+        let mut watcher = pin!(watch::make_watcher(&self.pwd).filter(|event| {
+            event
+                .paths
+                .iter()
+                .all(|path| path.extension().is_some() && !path.ends_with("swagger-initializer.js"))
+        }));
 
         loop {
             tokio::select! {
@@ -131,7 +137,7 @@ impl Server {
     }
 
     async fn handle_fs_event(&mut self, event: notify::Event) {
-        debug!(?event, "received fs event");
+        trace!(?event, "received fs event");
 
         let child = match &mut self.child {
             Ok(child) => child,
