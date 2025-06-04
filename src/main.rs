@@ -81,7 +81,13 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
-    let io = TcpStream::connect(("localhost", port)).await.unwrap();
+    let io = match TcpStream::connect(("localhost", port)).await {
+        Ok(io) => io,
+        Err(err) => {
+            error!(?err, "failed to connect to child");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let (mut sender, conn) = http1::Builder::new()
         .handshake::<_, Body>(TokioIo::new(io))
