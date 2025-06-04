@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     pin::pin,
     process,
+    sync::Arc,
     time::Duration,
 };
 
@@ -14,6 +15,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use axum_extra::middleware::option_layer;
 use clap::Parser;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -23,6 +25,12 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_stream::StreamExt as _;
+use tower::ServiceBuilder;
+use tower_http::{
+    ServiceBuilderExt as _,
+    request_id::MakeRequestUuid,
+    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
+};
 use tracing::{debug, error, info, trace};
 use tracing_subscriber::EnvFilter;
 
@@ -31,26 +39,35 @@ mod watch;
 
 #[derive(Parser, Debug)]
 struct Cli {
+    /// The port to listen on.
     #[arg(short, long)]
     port: u16,
+    /// The directory to run the server in.
     #[arg(long)]
     pwd: Option<PathBuf>,
+    /// Whether or not to enable verbose logging.
+    #[arg(long, short = 'V')]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() {
+    let args = args_os().take_while(|arg| arg != "--");
+    let cli = Cli::parse_from(args);
+
     tracing_subscriber::fmt::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
                 .as_deref()
-                .unwrap_or("build_proxy=debug")
+                .unwrap_or(if cli.verbose {
+                    "build_proxy=trace,tower_http=trace"
+                } else {
+                    "build_proxy=debug"
+                })
                 .parse::<EnvFilter>()
                 .unwrap(),
         )
         .init();
-
-    let args = args_os().take_while(|arg| arg != "--");
-    let cli = Cli::parse_from(args);
 
     let pwd = cli.pwd.unwrap_or_else(|| std::env::current_dir().unwrap());
 
@@ -61,7 +78,33 @@ async fn main() {
     let (server, handle) = Server::new(pwd.clone(), command_args).await;
     tokio::spawn(server.run());
 
-    let app = axum::routing::any(handler).with_state(AppState { handle });
+    let sensitive_headers = Arc::from([axum::http::header::COOKIE]);
+
+    let app = axum::routing::any(handler)
+        .layer(option_layer(cli.verbose.then(|| {
+            ServiceBuilder::new()
+                .map_response(|res: Response<_>| res.map(Body::new))
+                .sensitive_request_headers(Arc::clone(&sensitive_headers))
+                .set_x_request_id(MakeRequestUuid)
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(
+                            DefaultMakeSpan::default()
+                                .level(tracing::Level::TRACE)
+                                .include_headers(true),
+                        )
+                        .on_request(DefaultOnRequest::default().level(tracing::Level::TRACE))
+                        .on_response(
+                            DefaultOnResponse::default()
+                                .include_headers(true)
+                                .level(tracing::Level::TRACE),
+                        ),
+                )
+                .propagate_x_request_id()
+                .sensitive_response_headers(sensitive_headers)
+        })))
+        .with_state(AppState { handle });
+
     info!("listening on localhost:{}", cli.port);
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.port))
         .await
@@ -132,10 +175,11 @@ impl Server {
 
     async fn run(mut self) {
         let mut watcher = pin!(watch::make_watcher(&self.pwd).filter(|event| {
-            event
-                .paths
-                .iter()
-                .all(|path| path.extension().is_some() && !path.ends_with("swagger-initializer.js"))
+            event.paths.iter().all(|path| {
+                path.extension().is_some()
+                    && !path.ends_with("swagger-initializer.js")
+                    && !path.to_str().unwrap().contains("/node_modules/")
+            })
         }));
 
         loop {
