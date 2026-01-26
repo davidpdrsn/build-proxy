@@ -176,9 +176,11 @@ impl Server {
     async fn run(mut self) {
         let mut watcher = pin!(watch::make_watcher(&self.pwd).filter(|event| {
             event.paths.iter().all(|path| {
+                let path_str = path.to_str().unwrap();
                 path.extension().is_some()
                     && !path.ends_with("swagger-initializer.js")
-                    && !path.to_str().unwrap().contains("/node_modules/")
+                    && !path_str.contains("/node_modules/")
+                    && !path_str.contains("/.jj/")
             })
         }));
 
