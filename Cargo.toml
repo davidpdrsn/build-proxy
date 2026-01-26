@@ -3,6 +3,10 @@ name = "build-proxy"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "test-server"
+path = "tests/bin/test_server.rs"
+
 [dependencies]
 axum = "0.8.4"
 axum-extra = "0.10.1"
@@ -23,3 +27,7 @@ tower = "0.5.2"
 tower-http = { version = "0.6.5", features = ["trace", "request-id", "util", "sensitive-headers"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tempfile = "3"
