@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env::args_os,
     ffi::OsString,
     net::Ipv4Addr,
@@ -8,6 +9,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+use parking_lot::Mutex;
 
 use axum::{
     body::Body,
@@ -245,27 +248,39 @@ impl Server {
 
     async fn handle_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::GetPort { reply } => loop {
-                match &self.child {
-                    Ok(Some((_, port))) => {
-                        _ = reply.send(Some(*port));
-                        break;
-                    }
-                    Ok(None) => {
-                        let new_child = run_child_process(&self.pwd, self.args.iter())
-                            .await
-                            .map(Some);
-                        if let Ok(Some((_, port))) = new_child {
-                            info!(?port, "restarted child process");
+            Msg::GetPort { reply } => {
+                let mut rebuild_attempted = false;
+                loop {
+                    match &self.child {
+                        Ok(Some((_, port))) => {
+                            _ = reply.send(Some(*port));
+                            break;
                         }
-                        self.child = new_child;
-                    }
-                    Err(_) => {
-                        _ = reply.send(None);
-                        break;
+                        Ok(None) => {
+                            rebuild_attempted = true;
+                            let new_child = run_child_process(&self.pwd, self.args.iter())
+                                .await
+                                .map(Some);
+                            if let Ok(Some((_, port))) = new_child {
+                                info!(?port, "restarted child process");
+                            }
+                            self.child = new_child;
+                        }
+                        Err(_) => {
+                            if rebuild_attempted {
+                                // Already tried to rebuild this request, give up
+                                _ = reply.send(None);
+                                break;
+                            }
+                            // Reset to Ok(None) to attempt a rebuild
+                            // This handles the case where external conditions have changed
+                            // (e.g., dependencies installed, env vars set) without file changes
+                            info!("retrying build...");
+                            self.child = Ok(None);
+                        }
                     }
                 }
-            },
+            }
         }
     }
 }
@@ -334,6 +349,10 @@ where
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
+    // Collect recent stderr lines to display on build failure
+    let stderr_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let stderr_buffer_clone = Arc::clone(&stderr_buffer);
+
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -346,6 +365,15 @@ where
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let line = strip_ansi(&line);
+            // Store in buffer for potential error display
+            {
+                let mut buffer = stderr_buffer_clone.lock();
+                buffer.push_back(line.clone());
+                // Keep last 20 lines
+                while buffer.len() > 20 {
+                    buffer.pop_front();
+                }
+            }
             warn!(target: "build", "{}", line);
         }
     });
@@ -368,7 +396,25 @@ where
             Err(_) => {
                 match child.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        spinner.finish_with_message("Build failed");
+                        spinner.finish_and_clear();
+
+                        // Give stderr task a moment to flush remaining output
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+
+                        // Display captured error output
+                        let buffer = stderr_buffer.lock();
+                        if !buffer.is_empty() {
+                            error!("");
+                            error!("build failed:");
+                            error!("");
+                            for line in buffer.iter() {
+                                error!("  {}", line);
+                            }
+                            error!("");
+                        } else {
+                            error!("build failed");
+                        }
+
                         return Err(ChildBuildError);
                     }
                     _ => {}

@@ -3,6 +3,7 @@ use std::{
     process::{Child, Command, Stdio},
     time::Duration,
 };
+use tempfile::TempDir;
 use tokio::{net::TcpStream, time::sleep};
 
 /// Get the project root directory (where Cargo.toml is)
@@ -138,5 +139,181 @@ async fn test_rebuild_on_file_change() {
     assert_ne!(
         id1, id2,
         "expected server to be rebuilt after file change, but instance ID remained the same"
+    );
+}
+
+#[tokio::test]
+async fn test_rebuild_after_initial_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create a script that will fail initially (missing success marker)
+    let script_path = temp_path.join("server.sh");
+    let success_marker = temp_path.join("success_marker");
+    let trigger_file = temp_path.join("trigger.txt");
+
+    // Script that checks for success marker, fails if not present
+    // Uses Python's http.server which is more reliable than netcat
+    let script_content = format!(
+        r#"#!/bin/bash
+if [ ! -f "{}" ]; then
+    echo "Build failed: success marker not found" >&2
+    exit 1
+fi
+
+PORT="${{PORT}}"
+python3 -c "
+import http.server
+import socketserver
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'hello')
+    def log_message(self, format, *args):
+        pass  # Suppress logging
+
+with socketserver.TCPServer(('', $PORT), Handler) as httpd:
+    httpd.serve_forever()
+"
+"#,
+        success_marker.display()
+    );
+    std::fs::write(&script_path, script_content).unwrap();
+
+    // Make script executable
+    Command::new("chmod")
+        .args(["+x", script_path.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    let port = find_available_port();
+
+    // Start the proxy - this will fail initially
+    let mut process = Command::new(env!("CARGO_BIN_EXE_build-proxy"))
+        .args(["--port", &port.to_string()])
+        .args(["--pwd", temp_path.to_str().unwrap()])
+        .args(["--", script_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start build-proxy");
+
+    // Give it time to attempt and fail the initial build
+    sleep(Duration::from_millis(500)).await;
+
+    // Confirm proxy is up
+    let initial_server_ready = wait_for_server(port, Duration::from_millis(500)).await;
+    assert!(
+        initial_server_ready,
+        "proxy should be listening even if initial build failed"
+    );
+
+    // Now create the success marker so the build will succeed
+    std::fs::write(&success_marker, "ok").unwrap();
+
+    // Touch the trigger file to notify the watcher
+    std::fs::write(&trigger_file, "trigger").unwrap();
+
+    // Wait for file watcher to detect the change
+    sleep(Duration::from_millis(500)).await;
+
+    // Now try to make a request - should trigger a rebuild that succeeds
+    let response = reqwest::get(format!("http://127.0.0.1:{}/", port))
+        .await
+        .expect("request should succeed after rebuild");
+
+    // Clean up
+    let _ = process.kill();
+    let _ = process.wait();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "server should return 200 after successful rebuild"
+    );
+}
+
+/// Test that a rebuild is attempted when making a request after initial failure,
+/// even if no files have changed (the user might have fixed external dependencies)
+#[tokio::test]
+async fn test_rebuild_on_request_after_initial_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let script_path = temp_path.join("server.sh");
+    let success_marker = temp_path.join("success_marker");
+
+    // Script that checks for success marker, fails if not present
+    let script_content = format!(
+        r#"#!/bin/bash
+if [ ! -f "{}" ]; then
+    echo "Build failed: success marker not found" >&2
+    exit 1
+fi
+
+PORT="${{PORT}}"
+python3 -c "
+import http.server
+import socketserver
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'hello')
+    def log_message(self, format, *args):
+        pass
+
+with socketserver.TCPServer(('', $PORT), Handler) as httpd:
+    httpd.serve_forever()
+"
+"#,
+        success_marker.display()
+    );
+    std::fs::write(&script_path, script_content).unwrap();
+
+    Command::new("chmod")
+        .args(["+x", script_path.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    let port = find_available_port();
+
+    let mut process = Command::new(env!("CARGO_BIN_EXE_build-proxy"))
+        .args(["--port", &port.to_string()])
+        .args(["--pwd", temp_path.to_str().unwrap()])
+        .args(["--", script_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start build-proxy");
+
+    // Wait for proxy to be ready (initial build will fail)
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        wait_for_server(port, Duration::from_millis(500)).await,
+        "proxy should be listening"
+    );
+
+    // Fix the build (create success marker) BEFORE making any request
+    // This simulates: user fixes external dependency, then refreshes browser
+    std::fs::write(&success_marker, "ok").unwrap();
+
+    // Make a request - should trigger a rebuild that succeeds
+    let response = reqwest::get(format!("http://127.0.0.1:{}/", port))
+        .await
+        .expect("request should succeed");
+
+    let _ = process.kill();
+    let _ = process.wait();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "server should rebuild and return 200 when request comes in after initial failure, even without file changes"
     );
 }
