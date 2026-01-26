@@ -4,7 +4,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     pin::pin,
-    process,
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -19,9 +19,12 @@ use axum_extra::middleware::option_layer;
 use clap::Parser;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::{distr::Open01, prelude::*};
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
+    process::{Child, Command},
     sync::{mpsc, oneshot},
 };
 use tokio_stream::StreamExt as _;
@@ -31,8 +34,11 @@ use tower_http::{
     request_id::MakeRequestUuid,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{debug, error, info, trace};
-use tracing_subscriber::EnvFilter;
+use tracing::{error, info, trace, warn};
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::{
+    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 mod debounce;
 mod watch;
@@ -55,18 +61,25 @@ async fn main() {
     let args = args_os().take_while(|arg| arg != "--");
     let cli = Cli::parse_from(args);
 
-    tracing_subscriber::fmt::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .as_deref()
-                .unwrap_or(if cli.verbose {
-                    "build_proxy=trace,tower_http=trace"
-                } else {
-                    "build_proxy=debug"
-                })
-                .parse::<EnvFilter>()
-                .unwrap(),
+    let indicatif_layer = IndicatifLayer::new();
+
+    let env_filter = std::env::var("RUST_LOG")
+        .as_deref()
+        .unwrap_or(if cli.verbose {
+            "build_proxy=trace,tower_http=trace,build=trace"
+        } else {
+            "build_proxy=debug,build=info"
+        })
+        .parse::<EnvFilter>()
+        .unwrap();
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(indicatif_layer.get_stderr_writer())
+                .with_filter(env_filter),
         )
+        .with(indicatif_layer)
         .init();
 
     let pwd = cli.pwd.unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -152,7 +165,7 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
 
 struct Server {
     rx: mpsc::Receiver<Msg>,
-    child: Result<Option<(process::Child, u16)>, ChildBuildError>,
+    child: Result<Option<(Child, u16)>, ChildBuildError>,
     pwd: PathBuf,
     args: Vec<OsString>,
 }
@@ -212,9 +225,12 @@ impl Server {
             return;
         };
 
-        let pid = child.id();
+        let Some(pid) = child.id() else {
+            return;
+        };
+
         match nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as _),
+            nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
         ) {
             Ok(_) => {
@@ -275,7 +291,7 @@ enum Msg {
 async fn run_child_process<'a, I>(
     pwd: &Path,
     args: I,
-) -> Result<(process::Child, u16), ChildBuildError>
+) -> Result<(Child, u16), ChildBuildError>
 where
     I: Iterator<Item = &'a OsString>,
 {
@@ -286,7 +302,7 @@ where
     let env_vars = args.iter().map_while(|arg| {
         if let Some((key, value)) = arg.split_once('=') {
             if key.chars().next().unwrap().is_uppercase() {
-                return Some((key, value));
+                return Some((key.to_owned(), value.to_owned()));
             }
         }
         None
@@ -301,27 +317,61 @@ where
         false
     });
 
-    let mut cmd = std::process::Command::new(command_args.next().unwrap());
+    let mut cmd = Command::new(command_args.next().unwrap());
     cmd.args(command_args);
     cmd.envs(env_vars);
     cmd.current_dir(pwd);
     let port = random_port();
     cmd.env("PORT", port.to_string());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     info!(?cmd, "running child process");
 
     let mut child = cmd.spawn().unwrap();
 
+    // Spawn tasks to read and log stdout/stderr
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = strip_ansi(&line);
+            info!(target: "build", "{}", line);
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = strip_ansi(&line);
+            warn!(target: "build", "{}", line);
+        }
+    });
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message("Building...");
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
     loop {
         match TcpStream::connect(("localhost", port)).await {
-            Ok(_) => break,
-            Err(err) => {
-                debug!(?err, "child not ready yet...");
-
-                if let Ok(Some(status)) = child.try_wait() {
-                    if !status.success() {
+            Ok(_) => {
+                spinner.finish_and_clear();
+                break;
+            }
+            Err(_) => {
+                match child.try_wait() {
+                    Ok(Some(status)) if !status.success() => {
+                        spinner.finish_with_message("Build failed");
                         return Err(ChildBuildError);
                     }
+                    _ => {}
                 }
 
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -341,6 +391,11 @@ fn random_port() -> u16 {
 
 #[derive(Debug, Clone, Copy)]
 struct ChildBuildError;
+
+fn strip_ansi(s: &str) -> String {
+    let bytes = strip_ansi_escapes::strip(s);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 fn kill_processes_listening_on_port(port: u16) {
     let std::process::Output {

@@ -24,3 +24,5 @@ cargo test
 ```
 
 The e2e tests (`tests/e2e.rs`) exercise the full flow: start proxy, send request, trigger file change, verify rebuild.
+
+Run the tests after making changes.
