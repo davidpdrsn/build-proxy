@@ -39,9 +39,7 @@ use tower_http::{
 };
 use tracing::{error, info, trace, warn};
 use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::{
-    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod debounce;
 mod watch;
@@ -196,7 +194,8 @@ impl Server {
                 path.extension().is_some()
                     && !path.ends_with("swagger-initializer.js")
                     && !path_str.contains("/node_modules/")
-                    && !path_str.contains("/.jj/")
+                    && !path_str.contains("/.jj/repo/")
+                    && !path_str.contains("/.jj/working_copy/")
             })
         }));
 
@@ -303,10 +302,7 @@ enum Msg {
     GetPort { reply: oneshot::Sender<Option<u16>> },
 }
 
-async fn run_child_process<'a, I>(
-    pwd: &Path,
-    args: I,
-) -> Result<(Child, u16), ChildBuildError>
+async fn run_child_process<'a, I>(pwd: &Path, args: I) -> Result<(Child, u16), ChildBuildError>
 where
     I: Iterator<Item = &'a OsString>,
 {
