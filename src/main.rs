@@ -307,13 +307,15 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let args = args
-        .map(|s| s.to_str().unwrap().to_owned())
+        .map(|s| s.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
     let env_vars = args.iter().map_while(|arg| {
         if let Some((key, value)) = arg.split_once('=') {
-            if key.chars().next().unwrap().is_uppercase() {
-                return Some((key.to_owned(), value.to_owned()));
+            if let Some(first) = key.chars().next() {
+                if first.is_uppercase() {
+                    return Some((key.to_owned(), value.to_owned()));
+                }
             }
         }
         None
@@ -321,14 +323,19 @@ where
 
     let mut command_args = args.iter().skip_while(|arg| {
         if let Some((key, _)) = arg.split_once('=') {
-            if key.chars().next().unwrap().is_uppercase() {
-                return true;
+            if let Some(first) = key.chars().next() {
+                return first.is_uppercase();
             }
         }
         false
     });
 
-    let mut cmd = Command::new(command_args.next().unwrap());
+    let Some(command) = command_args.next() else {
+        error!("no command provided after --");
+        return Err(ChildBuildError);
+    };
+
+    let mut cmd = Command::new(command);
     cmd.args(command_args);
     cmd.envs(env_vars);
     cmd.current_dir(pwd);
@@ -339,7 +346,13 @@ where
 
     info!(?cmd, "running child process");
 
-    let mut child = cmd.spawn().unwrap();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            error!(%err, "failed to spawn child process");
+            return Err(ChildBuildError);
+        }
+    };
 
     // Spawn tasks to read and log stdout/stderr
     let stdout = child.stdout.take().unwrap();
