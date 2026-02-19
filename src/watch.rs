@@ -10,9 +10,18 @@ pub fn make_watcher(path: &Path) -> BoxStream<'static, notify::Event> {
     std::thread::spawn(move || {
         let (notify_tx, notify_rx) = std::sync::mpsc::channel();
 
-        let mut watcher = notify::recommended_watcher(notify_tx).unwrap();
+        let mut watcher = match notify::recommended_watcher(notify_tx) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                tracing::error!(%err, "failed to create filesystem watcher");
+                return;
+            }
+        };
 
-        watcher.watch(&path, RecursiveMode::Recursive).unwrap();
+        if let Err(err) = watcher.watch(&path, RecursiveMode::Recursive) {
+            tracing::error!(%err, ?path, "failed to start filesystem watcher");
+            return;
+        }
         for res in notify_rx {
             match res {
                 Ok(event) => {

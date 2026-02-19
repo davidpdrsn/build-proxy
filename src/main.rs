@@ -64,15 +64,22 @@ async fn main() {
 
     let indicatif_layer = IndicatifLayer::new();
 
-    let env_filter = std::env::var("RUST_LOG")
-        .as_deref()
-        .unwrap_or(if cli.verbose {
-            "build_proxy=trace,tower_http=trace,build=trace"
-        } else {
-            "build_proxy=debug,build=info"
-        })
-        .parse::<EnvFilter>()
-        .unwrap();
+    let default_filter = if cli.verbose {
+        "build_proxy=trace,tower_http=trace,build=trace"
+    } else {
+        "build_proxy=debug,build=info"
+    };
+
+    let env_filter = match std::env::var("RUST_LOG") {
+        Ok(filter) => match filter.parse::<EnvFilter>() {
+            Ok(filter) => filter,
+            Err(err) => {
+                eprintln!("invalid RUST_LOG value ({err}); falling back to {default_filter}");
+                EnvFilter::new(default_filter)
+            }
+        },
+        Err(_) => EnvFilter::new(default_filter),
+    };
 
     tracing_subscriber::registry()
         .with(
@@ -83,7 +90,16 @@ async fn main() {
         .with(indicatif_layer)
         .init();
 
-    let pwd = cli.pwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let pwd = match cli.pwd {
+        Some(path) => path,
+        None => match std::env::current_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                error!(?err, "failed to determine current working directory");
+                return;
+            }
+        },
+    };
 
     let command_args = args_os()
         .skip_while(|arg| arg != "--")
@@ -120,10 +136,16 @@ async fn main() {
         .with_state(AppState { handle });
 
     info!("listening on localhost:{}", cli.port);
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.port))
-        .await
-        .unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, cli.port)).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            error!(?err, port = cli.port, "failed to bind listener");
+            return;
+        }
+    };
+    if let Err(err) = axum::serve(listener, app).await {
+        error!(?err, "server exited with error");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,10 +168,16 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
-    let (mut sender, conn) = http1::Builder::new()
+    let (mut sender, conn) = match http1::Builder::new()
         .handshake::<_, Body>(TokioIo::new(io))
         .await
-        .unwrap();
+    {
+        Ok(parts) => parts,
+        Err(err) => {
+            error!(?err, "failed to handshake with child");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     tokio::task::spawn(conn);
 
@@ -190,7 +218,7 @@ impl Server {
     async fn run(mut self) {
         let mut watcher = pin!(watch::make_watcher(&self.pwd).filter(|event| {
             event.paths.iter().all(|path| {
-                let path_str = path.to_str().unwrap();
+                let path_str = path.to_string_lossy();
                 path.extension().is_some()
                     && !path.ends_with("swagger-initializer.js")
                     && !path_str.contains("/node_modules/")
@@ -292,8 +320,18 @@ struct Handle {
 impl Handle {
     async fn get_port(&self) -> Option<u16> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Msg::GetPort { reply: tx }).await.unwrap();
-        rx.await.unwrap()
+        if let Err(err) = self.tx.send(Msg::GetPort { reply: tx }).await {
+            error!(?err, "failed to contact server task");
+            return None;
+        }
+
+        match rx.await {
+            Ok(port) => port,
+            Err(err) => {
+                error!(?err, "server task dropped reply channel");
+                None
+            }
+        }
     }
 }
 
@@ -355,8 +393,20 @@ where
     };
 
     // Spawn tasks to read and log stdout/stderr
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            error!("child process stdout was not piped");
+            return Err(ChildBuildError);
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            error!("child process stderr was not piped");
+            return Err(ChildBuildError);
+        }
+    };
 
     // Collect recent stderr lines to display on build failure
     let stderr_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -388,11 +438,14 @@ where
     });
 
     let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
+    let spinner_style = match ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}") {
+        Ok(style) => style,
+        Err(err) => {
+            warn!(?err, "failed to configure spinner style, using default");
+            ProgressStyle::default_spinner()
+        }
+    };
+    spinner.set_style(spinner_style);
     spinner.set_message("Building...");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
@@ -453,24 +506,56 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn kill_processes_listening_on_port(port: u16) {
-    let std::process::Output {
-        stdout,
-        status: _,
-        stderr: _,
-    } = std::process::Command::new("lsof")
+    let output = match std::process::Command::new("lsof")
         .args(["-ti"])
         .args([format!(":{port}")])
         .output()
-        .unwrap();
+    {
+        Ok(output) => output,
+        Err(err) => {
+            warn!(?err, ?port, "failed to run lsof");
+            return;
+        }
+    };
 
-    let stdout = String::from_utf8(stdout).unwrap();
+    if !output.status.success() {
+        trace!(?port, status = ?output.status, "lsof found no processes to kill");
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let pid = line.parse::<i32>().unwrap();
-        nix::sys::signal::kill(
+        let pid = match line.parse::<i32>() {
+            Ok(pid) => pid,
+            Err(err) => {
+                warn!(?err, line, "failed to parse pid from lsof output");
+                continue;
+            }
+        };
+
+        if let Err(err) = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGKILL,
-        )
-        .unwrap();
+        ) {
+            trace!(?err, ?pid, "failed to kill process on port");
+            continue;
+        }
+
         info!(?pid, "killed child process");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_port_returns_none_if_server_task_is_gone() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let handle = Handle { tx };
+
+        assert_eq!(handle.get_port().await, None);
     }
 }
