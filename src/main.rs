@@ -13,9 +13,10 @@ use std::{
 use parking_lot::Mutex;
 
 use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::StatusCode,
+    body::{Body, Bytes},
+    extract::{FromRequest, Request, State},
+    http::{self, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use axum_extra::middleware::option_layer;
@@ -133,6 +134,7 @@ async fn main() {
                 .propagate_x_request_id()
                 .sensitive_response_headers(sensitive_headers)
         })))
+        // .layer(middleware::from_fn(log_request_body))
         .with_state(AppState { handle });
 
     info!("listening on localhost:{}", cli.port);
@@ -543,6 +545,32 @@ fn kill_processes_listening_on_port(port: u16) {
 
         info!(?pid, "killed child process");
     }
+}
+
+async fn log_request_body(
+    method: http::Method,
+    uri: http::Uri,
+    version: http::Version,
+    headers: http::HeaderMap,
+    extensions: http::Extensions,
+    body: Bytes,
+    next: Next,
+) -> Response {
+    let mut builder = Request::builder()
+        .method(method.clone())
+        .uri(uri.clone())
+        .version(version);
+    *builder.headers_mut().unwrap() = headers;
+    *builder.extensions_mut().unwrap() = extensions;
+    let (parts, _) = builder.body(()).unwrap().into_parts();
+
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+        let json = serde_json::to_string_pretty(&json).unwrap();
+        std::fs::write(format!("/Users/davidpdrsn/Desktop/{method}.json"), json).unwrap();
+    }
+
+    next.run(axum::extract::Request::from_parts(parts, Body::from(body)))
+        .await
 }
 
 #[cfg(test)]
