@@ -13,10 +13,9 @@ use std::{
 use parking_lot::Mutex;
 
 use axum::{
-    body::{Body, Bytes},
-    extract::{FromRequest, Request, State},
-    http::{self, StatusCode},
-    middleware::{self, Next},
+    body::Body,
+    extract::{Request, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use axum_extra::middleware::option_layer;
@@ -106,8 +105,14 @@ async fn main() {
         .skip_while(|arg| arg != "--")
         .skip(1)
         .collect::<Vec<_>>();
-    let (server, handle) = Server::new(pwd.clone(), command_args).await;
+    let (server, handle) = Server::new(pwd.clone(), command_args);
     tokio::spawn(server.run());
+
+    // Trigger initial build in the background.
+    let warmup_handle = handle.clone();
+    tokio::spawn(async move {
+        warmup_handle.warmup_build().await;
+    });
 
     let sensitive_headers = Arc::from([axum::http::header::COOKIE]);
 
@@ -134,7 +139,6 @@ async fn main() {
                 .propagate_x_request_id()
                 .sensitive_response_headers(sensitive_headers)
         })))
-        // .layer(middleware::from_fn(log_request_body))
         .with_state(AppState { handle });
 
     info!("listening on localhost:{}", cli.port);
@@ -195,21 +199,26 @@ async fn handler(State(state): State<AppState>, req: Request) -> Response {
 }
 
 struct Server {
+    tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     child: Result<Option<(Child, u16)>, ChildBuildError>,
+    building: bool,
+    waiters: Vec<oneshot::Sender<Option<u16>>>,
     pwd: PathBuf,
     args: Vec<OsString>,
 }
 
 impl Server {
-    async fn new(pwd: PathBuf, args: Vec<OsString>) -> (Server, Handle) {
+    fn new(pwd: PathBuf, args: Vec<OsString>) -> (Server, Handle) {
         let (tx, rx) = mpsc::channel::<Msg>(1024);
-        let child = run_child_process(&pwd, args.iter()).await.map(Some);
 
         (
             Server {
+                tx: tx.clone(),
                 rx,
-                child,
+                child: Ok(None),
+                building: false,
+                waiters: Vec::new(),
                 pwd,
                 args,
             },
@@ -278,39 +287,68 @@ impl Server {
     async fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::GetPort { reply } => {
-                let mut rebuild_attempted = false;
-                loop {
-                    match &self.child {
-                        Ok(Some((_, port))) => {
-                            _ = reply.send(Some(*port));
-                            break;
+                if let Ok(Some((_, port))) = &self.child {
+                    _ = reply.send(Some(*port));
+                    return;
+                }
+
+                self.waiters.push(reply);
+                self.ensure_child_ready(true);
+            }
+            Msg::WarmupBuild => {
+                self.ensure_child_ready(false);
+            }
+            Msg::BuildFinished { result } => {
+                self.building = false;
+                match result {
+                    Ok((child, port)) => {
+                        self.child = Ok(Some((child, port)));
+                        info!(?port, "started child process");
+                        for waiter in self.waiters.drain(..) {
+                            _ = waiter.send(Some(port));
                         }
-                        Ok(None) => {
-                            rebuild_attempted = true;
-                            let new_child = run_child_process(&self.pwd, self.args.iter())
-                                .await
-                                .map(Some);
-                            if let Ok(Some((_, port))) = new_child {
-                                info!(?port, "restarted child process");
-                            }
-                            self.child = new_child;
-                        }
-                        Err(_) => {
-                            if rebuild_attempted {
-                                // Already tried to rebuild this request, give up
-                                _ = reply.send(None);
-                                break;
-                            }
-                            // Reset to Ok(None) to attempt a rebuild
-                            // This handles the case where external conditions have changed
-                            // (e.g., dependencies installed, env vars set) without file changes
-                            info!("retrying build...");
-                            self.child = Ok(None);
+                    }
+                    Err(err) => {
+                        self.child = Err(err);
+                        for waiter in self.waiters.drain(..) {
+                            _ = waiter.send(None);
                         }
                     }
                 }
             }
         }
+    }
+
+    fn ensure_child_ready(&mut self, retry_after_error: bool) {
+        match &self.child {
+            Ok(Some(_)) => {}
+            Ok(None) => self.start_build_if_needed(),
+            Err(_) => {
+                if retry_after_error {
+                    info!("retrying build...");
+                    self.child = Ok(None);
+                    self.start_build_if_needed();
+                }
+            }
+        }
+    }
+
+    fn start_build_if_needed(&mut self) {
+        if self.building {
+            return;
+        }
+
+        self.building = true;
+        let tx = self.tx.clone();
+        let pwd = self.pwd.clone();
+        let args = self.args.clone();
+
+        tokio::spawn(async move {
+            let result = run_child_process(&pwd, args.iter()).await;
+            if let Err(err) = tx.send(Msg::BuildFinished { result }).await {
+                error!(?err, "failed to send build result to server task");
+            }
+        });
     }
 }
 
@@ -335,11 +373,23 @@ impl Handle {
             }
         }
     }
+
+    async fn warmup_build(&self) {
+        if let Err(err) = self.tx.send(Msg::WarmupBuild).await {
+            error!(?err, "failed to trigger warmup build");
+        }
+    }
 }
 
 #[derive(Debug)]
 enum Msg {
-    GetPort { reply: oneshot::Sender<Option<u16>> },
+    GetPort {
+        reply: oneshot::Sender<Option<u16>>,
+    },
+    WarmupBuild,
+    BuildFinished {
+        result: Result<(Child, u16), ChildBuildError>,
+    },
 }
 
 async fn run_child_process<'a, I>(pwd: &Path, args: I) -> Result<(Child, u16), ChildBuildError>
@@ -545,32 +595,6 @@ fn kill_processes_listening_on_port(port: u16) {
 
         info!(?pid, "killed child process");
     }
-}
-
-async fn log_request_body(
-    method: http::Method,
-    uri: http::Uri,
-    version: http::Version,
-    headers: http::HeaderMap,
-    extensions: http::Extensions,
-    body: Bytes,
-    next: Next,
-) -> Response {
-    let mut builder = Request::builder()
-        .method(method.clone())
-        .uri(uri.clone())
-        .version(version);
-    *builder.headers_mut().unwrap() = headers;
-    *builder.extensions_mut().unwrap() = extensions;
-    let (parts, _) = builder.body(()).unwrap().into_parts();
-
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-        let json = serde_json::to_string_pretty(&json).unwrap();
-        std::fs::write(format!("/Users/davidpdrsn/Desktop/{method}.json"), json).unwrap();
-    }
-
-    next.run(axum::extract::Request::from_parts(parts, Body::from(body)))
-        .await
 }
 
 #[cfg(test)]

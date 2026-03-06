@@ -4,7 +4,7 @@
 //! - `GET /` - returns "hello"
 //! - `GET /instance-id` - returns a unique ID for this server instance (the PID)
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use std::net::Ipv4Addr;
 use tokio::net::TcpListener;
 
@@ -17,15 +17,13 @@ async fn main() {
 
     let instance_id = std::process::id().to_string();
 
-    let app = Router::new()
-        .route("/", get(|| async { "hello" }))
-        .route(
-            "/instance-id",
-            get(move || {
-                let id = instance_id.clone();
-                async move { id }
-            }),
-        );
+    let app = Router::new().route("/", get(|| async { "hello" })).route(
+        "/instance-id",
+        get(move || {
+            let id = instance_id.clone();
+            async move { id }
+        }),
+    );
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .await

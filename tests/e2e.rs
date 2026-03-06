@@ -82,7 +82,8 @@ impl TestProxy {
     }
 
     fn touch_trigger_file(&self) {
-        std::fs::write(&self.trigger_file, "trigger rebuild").expect("failed to write trigger file");
+        std::fs::write(&self.trigger_file, "trigger rebuild")
+            .expect("failed to write trigger file");
     }
 }
 
@@ -98,12 +99,73 @@ impl Drop for TestProxy {
 }
 
 #[tokio::test]
+async fn test_proxy_listens_while_initial_build_runs_in_background() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let script_path = temp_path.join("server.sh");
+    let script_content = r#"#!/bin/bash
+sleep 2
+
+PORT="${PORT}"
+python3 -c "
+import http.server
+import socketserver
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'hello')
+    def log_message(self, format, *args):
+        pass
+
+with socketserver.TCPServer(('', $PORT), Handler) as httpd:
+    httpd.serve_forever()
+"
+"#;
+    std::fs::write(&script_path, script_content).unwrap();
+
+    Command::new("chmod")
+        .args(["+x", script_path.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    let port = find_available_port();
+
+    let mut process = Command::new(env!("CARGO_BIN_EXE_build-proxy"))
+        .args(["--port", &port.to_string()])
+        .args(["--pwd", temp_path.to_str().unwrap()])
+        .args(["--", script_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start build-proxy");
+
+    assert!(
+        wait_for_server(port, Duration::from_millis(500)).await,
+        "proxy should listen immediately, before initial build completes"
+    );
+
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("request should eventually succeed once background build completes");
+
+    let _ = process.kill();
+    let _ = process.wait();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_proxy_forwards_requests() {
     let proxy = TestProxy::start().await;
 
-    let response = reqwest::get(proxy.url("/"))
-        .await
-        .expect("request failed");
+    let response = reqwest::get(proxy.url("/")).await.expect("request failed");
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.text().await.unwrap(), "hello");
@@ -221,7 +283,7 @@ with socketserver.TCPServer(('', $PORT), Handler) as httpd:
     sleep(Duration::from_millis(500)).await;
 
     // Now try to make a request - should trigger a rebuild that succeeds
-    let response = reqwest::get(format!("http://127.0.0.1:{}/", port))
+    let response = reqwest::get(format!("http://127.0.0.1:{port}/"))
         .await
         .expect("request should succeed after rebuild");
 
@@ -304,7 +366,7 @@ with socketserver.TCPServer(('', $PORT), Handler) as httpd:
     std::fs::write(&success_marker, "ok").unwrap();
 
     // Make a request - should trigger a rebuild that succeeds
-    let response = reqwest::get(format!("http://127.0.0.1:{}/", port))
+    let response = reqwest::get(format!("http://127.0.0.1:{port}/"))
         .await
         .expect("request should succeed");
 
