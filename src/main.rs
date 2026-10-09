@@ -16,7 +16,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
 };
 use axum_extra::middleware::option_layer;
 use clap::Parser;
@@ -162,8 +162,9 @@ struct AppState {
 async fn handler(State(state): State<AppState>, req: Request) -> Response {
     let AppState { handle } = state;
 
-    let Some(port) = handle.get_port().await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let port = match handle.get_port().await {
+        Ok(port) => port,
+        Err(err) => return err.into_response(),
     };
 
     let io = match TcpStream::connect(("localhost", port)).await {
@@ -203,7 +204,7 @@ struct Server {
     rx: mpsc::Receiver<Msg>,
     child: Result<Option<(Child, u16)>, ChildBuildError>,
     building: bool,
-    waiters: Vec<oneshot::Sender<Option<u16>>>,
+    waiters: Vec<oneshot::Sender<Result<u16, ChildBuildError>>>,
     pwd: PathBuf,
     args: Vec<OsString>,
 }
@@ -288,7 +289,7 @@ impl Server {
         match msg {
             Msg::GetPort { reply } => {
                 if let Ok(Some((_, port))) = &self.child {
-                    _ = reply.send(Some(*port));
+                    _ = reply.send(Ok(*port));
                     return;
                 }
 
@@ -305,14 +306,14 @@ impl Server {
                         self.child = Ok(Some((child, port)));
                         info!(?port, "started child process");
                         for waiter in self.waiters.drain(..) {
-                            _ = waiter.send(Some(port));
+                            _ = waiter.send(Ok(port));
                         }
                     }
                     Err(err) => {
-                        self.child = Err(err);
                         for waiter in self.waiters.drain(..) {
-                            _ = waiter.send(None);
+                            _ = waiter.send(Err(err.clone()));
                         }
+                        self.child = Err(err);
                     }
                 }
             }
@@ -358,18 +359,18 @@ struct Handle {
 }
 
 impl Handle {
-    async fn get_port(&self) -> Option<u16> {
+    async fn get_port(&self) -> Result<u16, ChildBuildError> {
         let (tx, rx) = oneshot::channel();
         if let Err(err) = self.tx.send(Msg::GetPort { reply: tx }).await {
             error!(?err, "failed to contact server task");
-            return None;
+            return Err(ChildBuildError::default());
         }
 
         match rx.await {
             Ok(port) => port,
             Err(err) => {
                 error!(?err, "server task dropped reply channel");
-                None
+                Err(ChildBuildError::default())
             }
         }
     }
@@ -384,7 +385,7 @@ impl Handle {
 #[derive(Debug)]
 enum Msg {
     GetPort {
-        reply: oneshot::Sender<Option<u16>>,
+        reply: oneshot::Sender<Result<u16, ChildBuildError>>,
     },
     WarmupBuild,
     BuildFinished {
@@ -422,11 +423,15 @@ where
 
     let Some(command) = command_args.next() else {
         error!("no command provided after --");
-        return Err(ChildBuildError);
+        return Err(ChildBuildError::default());
     };
 
     let mut cmd = Command::new(command);
     cmd.args(command_args);
+    // Cargo disables color when stderr is piped. Respect inherited and explicit overrides.
+    if std::env::var_os("CARGO_TERM_COLOR").is_none() {
+        cmd.env("CARGO_TERM_COLOR", "always");
+    }
     cmd.envs(env_vars);
     cmd.current_dir(pwd);
     let port = random_port();
@@ -440,7 +445,9 @@ where
         Ok(child) => child,
         Err(err) => {
             error!(%err, "failed to spawn child process");
-            return Err(ChildBuildError);
+            return Err(ChildBuildError {
+                output: format!("Failed to spawn child process: {err}"),
+            });
         }
     };
 
@@ -449,14 +456,14 @@ where
         Some(stdout) => stdout,
         None => {
             error!("child process stdout was not piped");
-            return Err(ChildBuildError);
+            return Err(ChildBuildError::default());
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
             error!("child process stderr was not piped");
-            return Err(ChildBuildError);
+            return Err(ChildBuildError::default());
         }
     };
 
@@ -472,10 +479,10 @@ where
         }
     });
 
-    tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let line = strip_ansi(&line);
+            // Preserve ANSI styles for the HTML error page.
             // Store in buffer for potential error display
             {
                 let mut buffer = stderr_buffer_clone.lock();
@@ -485,7 +492,7 @@ where
                     buffer.pop_front();
                 }
             }
-            warn!(target: "build", "{}", line);
+            warn!(target: "build", "{}", strip_ansi(&line));
         }
     });
 
@@ -513,8 +520,8 @@ where
                     Ok(Some(status)) if !status.success() => {
                         drop(spinner);
 
-                        // Give stderr task a moment to flush remaining output
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        // Drain stderr, but don't wait forever if a descendant holds the pipe open.
+                        _ = tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await;
 
                         // Display captured error output
                         let buffer = stderr_buffer.lock();
@@ -523,14 +530,16 @@ where
                             error!("build failed:");
                             error!("");
                             for line in buffer.iter() {
-                                error!("  {}", line);
+                                error!("  {}", strip_ansi(line));
                             }
                             error!("");
                         } else {
                             error!("build failed");
                         }
 
-                        return Err(ChildBuildError);
+                        return Err(ChildBuildError {
+                            output: buffer.iter().cloned().collect::<Vec<_>>().join("\n"),
+                        });
                     }
                     _ => {}
                 }
@@ -550,8 +559,46 @@ fn random_port() -> u16 {
     ((max - min) as f32 * val + min as f32) as u16
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ChildBuildError;
+#[derive(Debug, Clone, Default)]
+struct ChildBuildError {
+    output: String,
+}
+
+impl IntoResponse for ChildBuildError {
+    fn into_response(self) -> Response {
+        let plain_output = strip_ansi(&self.output);
+        let output = if plain_output.trim().is_empty() {
+            "The child server could not start. No compiler output was captured."
+        } else {
+            &self.output
+        };
+        // Conversion escapes HTML before adding style tags. Fall back to escaped plain text
+        // if malformed ANSI output cannot be converted.
+        let rendered = match ansi_to_html::convert(output) {
+            Ok(html) => html,
+            Err(err) => {
+                warn!(?err, "failed to convert compiler colors to HTML");
+                strip_ansi(output)
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#39;")
+            }
+        };
+        let html = format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <title>Build failed</title><style>\
+             body {{ background: #181818; color: #eee; padding: 2rem; font-family: system-ui; }}\
+             pre {{ overflow-x: auto; padding: 1rem; background: #222; line-height: 1.5; }}\
+             </style></head><body>\
+             <h1>Build failed</h1><p>Fix the error and refresh to retry the build.</p>\
+             <pre>{rendered}</pre></body></html>"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response()
+    }
+}
 
 fn strip_ansi(s: &str) -> String {
     let bytes = strip_ansi_escapes::strip(s);
@@ -600,15 +647,60 @@ fn kill_processes_listening_on_port(port: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ChildBuildError, Handle, IntoResponse, StatusCode, mpsc, run_child_process};
+    use http_body_util::BodyExt as _;
+    use std::ffi::OsString;
 
     #[tokio::test]
-    async fn get_port_returns_none_if_server_task_is_gone() {
+    async fn build_error_renders_colors_and_escapes_html() {
+        let response = ChildBuildError {
+            output: "\x1b[31merror: <script>alert('x')</script> & failed\x1b[0m".into(),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<span style='color:"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&amp; failed"));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains('\x1b'));
+    }
+
+    #[tokio::test]
+    async fn failed_child_preserves_ansi_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = [
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf '\\033[31mcompile error <T>\\033[0m\\n' >&2; exit 1"),
+        ];
+        let err = run_child_process(dir.path(), args.iter())
+            .await
+            .unwrap_err();
+        assert_eq!(err.output, "\x1b[31mcompile error <T>\x1b[0m");
+    }
+
+    #[tokio::test]
+    async fn build_error_without_output_renders_fallback() {
+        let response = ChildBuildError::default().into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("No compiler output was captured."));
+    }
+
+    #[tokio::test]
+    async fn get_port_returns_error_if_server_task_is_gone() {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
 
         let handle = Handle { tx };
 
-        assert_eq!(handle.get_port().await, None);
+        assert!(handle.get_port().await.is_err());
     }
 }

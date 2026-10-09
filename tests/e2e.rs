@@ -273,6 +273,25 @@ with socketserver.TCPServer(('', $PORT), Handler) as httpd:
         "proxy should be listening even if initial build failed"
     );
 
+    let failure = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("failed build should return an error page");
+    assert_eq!(failure.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        failure.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
+    assert!(
+        failure
+            .text()
+            .await
+            .unwrap()
+            .contains("Build failed: success marker not found")
+    );
+
     // Now create the success marker so the build will succeed
     std::fs::write(&success_marker, "ok").unwrap();
 
