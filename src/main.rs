@@ -22,7 +22,7 @@ use axum_extra::middleware::option_layer;
 use clap::Parser;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use rand::{distr::Open01, prelude::*};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -38,7 +38,7 @@ use tower_http::{
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
 use tracing::{error, info, trace, warn};
-use tracing_indicatif::IndicatifLayer;
+use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt as _};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod debounce;
@@ -489,7 +489,8 @@ where
         }
     });
 
-    let spinner = ProgressBar::new_spinner();
+    // Share the logging layer's progress manager so logs clear and redraw the spinner.
+    let spinner = tracing::info_span!("building");
     let spinner_style = match ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}") {
         Ok(style) => style,
         Err(err) => {
@@ -497,20 +498,20 @@ where
             ProgressStyle::default_spinner()
         }
     };
-    spinner.set_style(spinner_style);
-    spinner.set_message("Building...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner.pb_set_style(&spinner_style);
+    spinner.pb_set_message("Building...");
+    spinner.pb_start();
 
     loop {
         match TcpStream::connect(("localhost", port)).await {
             Ok(_) => {
-                spinner.finish_and_clear();
+                drop(spinner);
                 break;
             }
             Err(_) => {
                 match child.try_wait() {
                     Ok(Some(status)) if !status.success() => {
-                        spinner.finish_and_clear();
+                        drop(spinner);
 
                         // Give stderr task a moment to flush remaining output
                         tokio::time::sleep(Duration::from_millis(50)).await;
